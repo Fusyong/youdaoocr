@@ -1,0 +1,8 @@
+*.jpg
+*.png
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+.venv/
