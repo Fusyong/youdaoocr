@@ -344,4 +344,9 @@ def demo_usage():
 
 
 if __name__ == "__main__":
-    demo_usage()
+    # demo_usage()
+    with open('o_ocr.json', 'r', encoding='utf-8') as f:
+        json_data = json.load(f)
+        converter = OCRToMarkdownConverter()
+        md = converter.convert_json_to_markdown(json_data)
+        print(md)
