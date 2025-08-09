@@ -9,4 +9,4 @@ image = io.imread('1.jpg')
 grayscale = rgb2gray(image)
 angle = determine_skew(grayscale)
 rotated = rotate(image, angle, resize=True) * 255
-io.imsave('output.png', rotated.astype(np.uint8))
+io.imsave('output.jpg', rotated.astype(np.uint8))

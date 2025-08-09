@@ -6,7 +6,7 @@ import json
 import requests
 
 from utils.AuthV3Util import addAuthParams
-from ocr_to_markdown import OCRToMarkdownConverter
+from ocr_json2text_line import OCRJsonToTextLine
 
 # 您的应用ID
 APP_KEY = '57de4a67883a784c'
@@ -44,18 +44,18 @@ def createRequest():
         # 解析JSON响应
         json_response = json.loads(str(res.content, 'utf-8'))
 
-        # 转换为Markdown
-        converter = OCRToMarkdownConverter()
-        markdown_content = converter.convert_json_to_markdown(json_response)
+        # 转换为文本
+        converter = OCRJsonToTextLine()
+        text_content = converter.convert_json_to_text(json_response)
 
-        # 保存Markdown文件
-        output_filename = PATH.replace('.jpg', '.md').replace('.png', '.md')
+        # 保存文本文件
+        output_filename = PATH.replace('.jpg', '.txt').replace('.png', '.txt')
         with open(output_filename, 'w', encoding='utf-8') as f:
-            f.write(markdown_content)
+            f.write(text_content)
 
-        print(f"OCR识别完成，Markdown文件已保存为: {output_filename}")
+        print(f"OCR识别完成，文本文件已保存为: {output_filename}")
         print("\n转换结果:")
-        print(markdown_content)
+        print(text_content)
 
         # 同时保存原始JSON结果
         json_filename = PATH.replace('.jpg', '_ocr.json').replace('.png', '_ocr.json')

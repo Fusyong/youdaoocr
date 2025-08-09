@@ -4,10 +4,12 @@ OCR JSON结果转Markdown转换器
 """
 
 import json
-import re
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
+import os
+import statistics
+import time
 
 
 class TextDirection(Enum):
@@ -26,17 +28,26 @@ class BoundingBox:
 
     @classmethod
     def from_string(cls, bbox_str: str) -> 'BoundingBox':
-        """从字符串解析边界框信息"""
+        """从字符串解析边界框信息
+
+        兼容两类格式：
+        - "x,y,width,height"
+        - "x1,y1,x2,y2,x3,y3,x4,y4"（四角点坐标，多边形）
+        """
         try:
-            # 格式: "x,y,width,height"
-            parts = bbox_str.split(',')
+            parts = [p.strip() for p in bbox_str.split(',') if p.strip()]
+            # 宽高格式
             if len(parts) == 4:
-                return cls(
-                    x=int(parts[0]),
-                    y=int(parts[1]),
-                    width=int(parts[2]),
-                    height=int(parts[3])
-                )
+                x, y, w, h = map(int, parts)
+                return cls(x=x, y=y, width=w, height=h)
+
+            # 四点格式（取外接矩形）
+            if len(parts) == 8:
+                xs = list(map(int, [parts[0], parts[2], parts[4], parts[6]]))
+                ys = list(map(int, [parts[1], parts[3], parts[5], parts[7]]))
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                return cls(x=min_x, y=min_y, width=max_x - min_x, height=max_y - min_y)
         except (ValueError, IndexError):
             pass
         return cls(0, 0, 0, 0)
@@ -62,6 +73,8 @@ class Line:
     text: str
     words: List[Word]
     boundingBox: BoundingBox
+    text_height: int = 0
+    style: str = ''
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Line':
@@ -69,7 +82,9 @@ class Line:
         return cls(
             text=data.get('text', ''),
             words=words,
-            boundingBox=BoundingBox.from_string(data.get('boundingBox', '0,0,0,0'))
+            boundingBox=BoundingBox.from_string(data.get('boundingBox', '0,0,0,0')),
+            text_height=int(data.get('text_height', 0) or 0),
+            style=str(data.get('style', '') or '')
         )
 
 
@@ -92,261 +107,320 @@ class Region:
         )
 
 
-class OCRToMarkdownConverter:
-    """OCR JSON结果转Markdown转换器"""
+class OCRJsonToTextLine:
+    """OCR JSON → 纯文本行（含版面空格/空行）转换器"""
 
     def __init__(self):
-        self.title_patterns = [
-            r'^第[一二三四五六七八九十\d]+[章节篇]',
-            r'^[一二三四五六七八九十\d]+[、\.]',
-            r'^[A-Z][A-Z\s]*$',  # 全大写英文标题
-            r'^[A-Z][a-z\s]+$',  # 首字母大写英文标题
-        ]
-        self.subtitle_patterns = [
-            r'^[一二三四五六七八九十\d]+[、\.]',
-            r'^[A-Z][a-z\s]+$',
-        ]
+        # 常量持久化文件
+        self.constants_file = 'ocr_layout_constants.json'
+        # 同行判定阈值（占行距比例）
+        self.same_line_threshold_ratio = 0.4
 
-    def is_title(self, text: str) -> bool:
-        """判断是否为标题"""
-        text = text.strip()
-        if len(text) < 2 or len(text) > 50:
-            return False
-
-        for pattern in self.title_patterns:
-            if re.match(pattern, text):
+    # ====== 布局常量估计与持久化 ======
+    def _contains_cjk(self, s: str) -> bool:
+        """是否包含中日韩统一表意文字（用于估计正文汉字高度）"""
+        for ch in s:
+            code = ord(ch)
+            if (
+                0x4E00 <= code <= 0x9FFF or
+                0x3400 <= code <= 0x4DBF or
+                0x20000 <= code <= 0x2A6DF or
+                0x2A700 <= code <= 0x2B73F or
+                0x2B740 <= code <= 0x2B81F or
+                0x2B820 <= code <= 0x2CEAF
+            ):
                 return True
         return False
 
-    def is_subtitle(self, text: str) -> bool:
-        """判断是否为副标题"""
-        text = text.strip()
-        if len(text) < 2 or len(text) > 30:
-            return False
+    def _robust_median(self, values: List[float]) -> float:
+        if not values:
+            return 0.0
+        try:
+            return float(statistics.median(values))
+        except statistics.StatisticsError:
+            return float(values[0])
 
-        for pattern in self.subtitle_patterns:
-            if re.match(pattern, text):
-                return True
-        return False
+    def _load_constants(self) -> Dict[str, Any]:
+        if not os.path.exists(self.constants_file):
+            return {}
+        try:
+            with open(self.constants_file, 'r', encoding='utf-8') as fp:
+                return json.load(fp)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return {}
 
-    def is_list_item(self, text: str) -> bool:
-        """判断是否为列表项"""
-        text = text.strip()
-        list_patterns = [
-            r'^[•·▪▫◦‣⁃]\s*',
-            r'^[\d]+[\.\)]\s*',
-            r'^[①②③④⑤⑥⑦⑧⑨⑩]\s*',
-            r'^[a-z][\.\)]\s*',
-            r'^[A-Z][\.\)]\s*',
-        ]
+    def _save_constants(self, constants: Dict[str, Any]) -> None:
+        try:
+            with open(self.constants_file, 'w', encoding='utf-8') as fp:
+                json.dump(constants, fp, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
 
-        for pattern in list_patterns:
-            if re.match(pattern, text):
-                return True
-        return False
+    def estimate_layout_constants(self, regions: List['Region']) -> Tuple[float, float, Dict[str, int]]:
+        """遍历所有 box，估计正文汉字高度与行高倍数，并结合历史常量进行微调/回落
 
-    def is_emphasis(self, text: str) -> bool:
-        """判断是否为强调文本（粗体）"""
-        # 检查是否包含特殊格式标记或全大写
-        if text.isupper() and len(text) > 1:
-            return True
-        # 检查是否包含书名号、引号等
-        if re.search(r'[《》""''【】]', text):
-            return True
-        return False
+        返回: (char_height_px, line_height_multiplier, sample_counts)
+        """
+        char_heights: List[float] = []
+        line_heights: List[float] = []
 
-    def format_text(self, text: str) -> str:
-        """格式化文本"""
-        text = text.strip()
-        if not text:
-            return ""
+        # 收集样本
+        for region in regions:
+            for line in region.lines:
+                # 行高样本优先用行 bbox，其次 text_height
+                if line.boundingBox and line.boundingBox.height > 0:
+                    line_heights.append(float(line.boundingBox.height))
+                elif line.text_height:
+                    line_heights.append(float(line.text_height))
 
-        # 处理强调文本
-        if self.is_emphasis(text):
-            return f"**{text}**"
+                for w in line.words:
+                    if not w or not w.word:
+                        continue
+                    if self._contains_cjk(w.word) and w.boundingBox and w.boundingBox.height > 0:
+                        char_heights.append(float(w.boundingBox.height))
 
-        return text
+        current_char_height = self._robust_median(char_heights) if len(char_heights) >= 5 else 0.0
+        current_line_height = self._robust_median(line_heights) if len(line_heights) >= 3 else 0.0
 
-    def convert_regions_to_markdown(self, regions: List[Region]) -> str:
-        """将区域列表转换为Markdown"""
-        markdown_lines = []
-        current_list_level = 0
+        # 计算倍数（以正文汉字高度为基准）
+        current_multiplier = 0.0
+        if current_char_height > 0 and current_line_height > 0:
+            ratios = [lh / current_char_height for lh in line_heights if lh > 0]
+            current_multiplier = self._robust_median(ratios)
 
-        # 按垂直位置排序区域
-        sorted_regions = sorted(regions, key=lambda r: r.boundingBox.y)
+        # 载入历史常量
+        loaded = self._load_constants()
+        prev_char_height = float(loaded.get('char_height', 0) or 0)
+        prev_multiplier = float(loaded.get('line_height_multiplier', 0) or 0)
+        prev_counts = loaded.get('sample_counts', {}) if isinstance(loaded.get('sample_counts', {}), dict) else {}
+        prev_char_n = int(prev_counts.get('char', 0))
+        prev_line_n = int(prev_counts.get('line', 0))
 
-        for region in sorted_regions:
-            # 处理垂直文本
-            if region.dir == TextDirection.VERTICAL.value:
-                markdown_lines.extend(self._process_vertical_text(region))
+        # 样本量
+        char_n = len(char_heights)
+        line_n = len(line_heights)
+
+        # 稀疏判定：字样本<5 或 行样本<3 则较少
+        sparse_char = char_n < 5
+        sparse_line = line_n < 3
+
+        # 合成结果
+        final_char_height = current_char_height
+        final_multiplier = current_multiplier
+
+        # 如果当前样本过少，回落历史；否则按样本量加权微调
+        if prev_char_height > 0:
+            if sparse_char or current_char_height <= 0:
+                final_char_height = prev_char_height
             else:
-                markdown_lines.extend(self._process_horizontal_text(region))
+                alpha_char = min(0.7, char_n / float(char_n + prev_char_n + 1e-6))
+                final_char_height = alpha_char * current_char_height + (1 - alpha_char) * prev_char_height
 
-        # 后处理：合并连续的列表项
-        markdown_lines = self._merge_list_items(markdown_lines)
-
-        return '\n'.join(markdown_lines)
-
-    def _process_horizontal_text(self, region: Region) -> List[str]:
-        """处理水平文本"""
-        lines = []
-
-        # 按垂直位置排序行
-        sorted_lines = sorted(region.lines, key=lambda l: l.boundingBox.y)
-
-        for line in sorted_lines:
-            text = line.text.strip()
-            if not text:
-                continue
-
-            # 判断文本类型并格式化
-            if self.is_title(text):
-                lines.append(f"# {text}")
-            elif self.is_subtitle(text):
-                lines.append(f"## {text}")
-            elif self.is_list_item(text):
-                lines.append(f"- {text}")
+        if prev_multiplier > 0:
+            if sparse_line or current_multiplier <= 0:
+                final_multiplier = prev_multiplier
             else:
-                formatted_text = self.format_text(text)
-                if formatted_text:
-                    lines.append(formatted_text)
+                alpha_line = min(0.7, line_n / float(line_n + prev_line_n + 1e-6))
+                final_multiplier = alpha_line * current_multiplier + (1 - alpha_line) * prev_multiplier
 
-        return lines
+        # 如仍无有效数值，给出保守默认
+        if final_char_height <= 0:
+            final_char_height = 32.0  # 经验默认值
+        if final_multiplier <= 0:
+            final_multiplier = 1.5
 
-    def _process_vertical_text(self, region: Region) -> List[str]:
-        """处理垂直文本"""
-        lines = []
+        # 夹制行高倍数在合理区间（通常 1.2 ~ 2.0）
+        final_multiplier = max(1.2, min(2.0, final_multiplier))
 
-        # 按水平位置排序行（垂直文本）
-        sorted_lines = sorted(region.lines, key=lambda l: l.boundingBox.x)
+        # 更新计数，限制上限避免惯性过大
+        new_char_n = min(1000, prev_char_n + char_n)
+        new_line_n = min(1000, prev_line_n + line_n)
 
-        for line in sorted_lines:
-            text = line.text.strip()
-            if not text:
+        # 持久化
+        self._save_constants({
+            'char_height': round(final_char_height, 2),
+            'line_height_multiplier': round(final_multiplier, 3),
+            'sample_counts': {'char': new_char_n, 'line': new_line_n},
+            'updated_at': int(time.time())
+        })
+
+        return final_char_height, final_multiplier, {'char': char_n, 'line': line_n}
+
+    def convert_regions_to_text_lines(self, regions: List[Region], char_height: float, line_multiplier: float) -> List[str]:
+        """将区域列表转换为纯文本行（跨 region 同行合并、行首缩进与行间空行）"""
+        text_lines: List[str] = []
+
+        # 1) 处理水平文本：收集所有行分片
+        fragments = self._collect_horizontal_fragments(regions)
+        if fragments:
+            line_spacing = max(1.0, char_height * line_multiplier)
+            grouped = self._group_fragments_by_line(fragments, line_spacing, self.same_line_threshold_ratio)
+            # 文字区域左边界（全局最小 x）
+            base_left = min((f['x'] for f in fragments), default=0)
+            # 合并每一行的分片，按像素间距 → 空格数（两个空格≈一个正文汉字高度）
+            prev_row: Optional[List[Dict[str, Any]]] = None
+            for row in grouped:
+                # 行间距 → 空行
+                if prev_row is not None:
+                    blanks = self._compute_blank_lines_between(prev_row, row, line_spacing)
+                    if blanks > 0:
+                        text_lines.extend([''] * blanks)
+                # 行首缩进：行头到文字区域左边界的距离以空格填充
+                indent_spaces = self._compute_row_indent_spaces(row, base_left, char_height)
+                joined = self._join_fragments_with_spacing(row, char_height)
+                stripped = joined.strip()
+                if not stripped:
+                    continue
+                text_lines.append((' ' * indent_spaces) + stripped)
+                prev_row = row
+
+        # 2) 垂直文本：保持原有处理，作为引用
+        vertical_regions = [r for r in regions if r.dir == TextDirection.VERTICAL.value]
+        if vertical_regions:
+            vertical_regions = sorted(vertical_regions, key=lambda r: r.boundingBox.x)
+            for region in vertical_regions:
+                # 将垂直文本直接按普通文本输出（不加 markdown 引用符号）
+                sorted_lines = sorted(region.lines, key=lambda l: l.boundingBox.x)
+                for line in sorted_lines:
+                    text = (line.text or '').strip()
+                    if text:
+                        text_lines.append(text)
+
+        return text_lines
+
+    def _compute_row_indent_spaces(self, row: List[Dict[str, Any]], base_left: int, char_height: float) -> int:
+        """计算一行行头相对文字区域左边界的空格数（两个空格≈一个汉字高度）"""
+        if not row:
+            return 0
+        if char_height <= 0:
+            char_height = 32.0
+        left_x = min(item['x'] for item in row)
+        indent_px = max(0, left_x - int(base_left or 0))
+        spaces = int(round((indent_px / char_height) * 2))
+        return max(0, spaces)
+
+    def _compute_blank_lines_between(self, prev_row: List[Dict[str, Any]], curr_row: List[Dict[str, Any]], line_spacing: float) -> int:
+        """根据两行的垂直间距，折算为空行数量并返回。
+        以上一行的下边界与下一行的上边界的像素差为基准：
+        blanks = floor(gap_px / line_spacing)
+        """
+        if not prev_row or not curr_row or line_spacing <= 0:
+            return 0
+        prev_bottom = max(item['y'] + item['height'] for item in prev_row)
+        curr_top = min(item['y'] for item in curr_row)
+        gap_px = max(0.0, float(curr_top - prev_bottom))
+        blanks = int(gap_px // line_spacing)
+        return max(0, blanks)
+
+    def _collect_horizontal_fragments(self, regions: List[Region]) -> List[Dict[str, Any]]:
+        """从所有 region 收集水平文本分片（以行 bbox 为准）。
+        返回的分片包含: text, x, y, width, height
+        """
+        fragments: List[Dict[str, Any]] = []
+        for region in regions:
+            if region.dir != TextDirection.HORIZONTAL.value:
                 continue
+            for line in region.lines:
+                if not line or not line.text:
+                    continue
+                bbox = line.boundingBox or region.boundingBox
+                if not bbox:
+                    continue
+                fragments.append({
+                    'text': line.text.strip(),
+                    'x': int(bbox.x),
+                    'y': int(bbox.y),
+                    'width': int(bbox.width),
+                    'height': int(bbox.height),
+                })
+        return fragments
 
-            # 垂直文本通常作为引用或特殊格式处理
-            formatted_text = self.format_text(text)
-            if formatted_text:
-                lines.append(f"> {formatted_text}")
+    def _group_fragments_by_line(self, fragments: List[Dict[str, Any]], line_spacing: float, ratio: float) -> List[List[Dict[str, Any]]]:
+        """按 y 中心与行距的比例阈值聚类为同一行。"""
+        if not fragments:
+            return []
+        # 以 y 中心排序，便于顺序聚类
+        for frag in fragments:
+            frag['y_mid'] = frag['y'] + frag['height'] / 2.0
+        fragments.sort(key=lambda frag: frag['y_mid'])
 
-        return lines
+        threshold = max(1.0, ratio * line_spacing)
+        groups: List[List[Dict[str, Any]]] = []
+        current_group: List[Dict[str, Any]] = []
+        current_mid: Optional[float] = None
 
-    def _merge_list_items(self, lines: List[str]) -> List[str]:
-        """合并连续的列表项"""
-        if not lines:
-            return lines
-
-        merged_lines = []
-        i = 0
-
-        while i < len(lines):
-            current_line = lines[i]
-
-            # 检查是否为列表项
-            if current_line.startswith('- '):
-                # 收集连续的列表项
-                list_items = [current_line[2:]]  # 去掉 "- " 前缀
-                i += 1
-
-                # 查找连续的列表项
-                while i < len(lines) and lines[i].startswith('- '):
-                    list_items.append(lines[i][2:])
-                    i += 1
-
-                # 合并列表项
-                if len(list_items) > 1:
-                    merged_lines.append('- ' + '\n- '.join(list_items))
+        for item in fragments:
+            if current_group and current_mid is not None:
+                if abs(item['y_mid'] - current_mid) <= threshold:
+                    current_group.append(item)
+                    # 更新组中心（滚动平均）
+                    current_mid = (current_mid * (len(current_group) - 1) + item['y_mid']) / len(current_group)
                 else:
-                    merged_lines.append(current_line)
+                    # 关闭当前组
+                    groups.append(sorted(current_group, key=lambda frag: frag['x']))
+                    current_group = [item]
+                    current_mid = item['y_mid']
             else:
-                merged_lines.append(current_line)
-                i += 1
+                current_group = [item]
+                current_mid = item['y_mid']
 
-        return merged_lines
+        if current_group:
+            groups.append(sorted(current_group, key=lambda frag: frag['x']))
 
-    def convert_json_to_markdown(self, json_data: Dict[str, Any]) -> str:
-        """将OCR JSON结果转换为Markdown"""
+        return groups
+
+    def _join_fragments_with_spacing(self, row: List[Dict[str, Any]], char_height: float) -> str:
+        """按片段的左右间距，以“两个空格≈一个汉字高度”的换算插入空格"""
+        if not row:
+            return ''
+        if char_height <= 0:
+            char_height = 32.0
+        parts: List[str] = []
+        prev_right = None
+        for frag in row:
+            if prev_right is None:
+                parts.append(frag['text'])
+                prev_right = frag['x'] + frag['width']
+                continue
+            gap_px = max(0, frag['x'] - prev_right)
+            # 两个空格折算为一个正文汉字高度
+            spaces = int(round((gap_px / char_height) * 2))
+            if spaces > 0:
+                parts.append(' ' * spaces)
+            parts.append(frag['text'])
+            prev_right = frag['x'] + frag['width']
+        return ''.join(parts)
+
+
+    def convert_json_to_text(self, ocr_json: Dict[str, Any]) -> str:
+        """将OCR JSON结果转换为纯文本（带空格/空行）"""
         try:
             # 解析JSON数据
-            if 'Result' not in json_data:
+            if 'Result' not in ocr_json:
                 raise ValueError("JSON数据中缺少'Result'字段")
 
-            result = json_data['Result']
+            result = ocr_json['Result']
             regions_data = result.get('regions', [])
 
             # 转换为Region对象
             regions = [Region.from_dict(region_data) for region_data in regions_data]
 
-            # 转换为Markdown
-            markdown_content = self.convert_regions_to_markdown(regions)
+            # 估计布局常量
+            char_h, line_mul, _ = self.estimate_layout_constants(regions)
 
-            return markdown_content
+            # 转换为纯文本行
+            lines = self.convert_regions_to_text_lines(regions, char_h, line_mul)
+            return '\n'.join(lines)
 
-        except Exception as e:
+        except (KeyError, TypeError, ValueError) as e:
             return f"转换失败: {str(e)}"
 
-
-def demo_usage():
-    """演示用法"""
-    # 示例JSON数据（根据有道OCR API返回格式）
-    sample_json = {
-        "errorCode": "0",
-        "Result": {
-            "orientation": "0",
-            "regions": [
-                {
-                    "lang": "zh-CHS",
-                    "dir": "h",
-                    "boundingBox": "10,10,200,30",
-                    "lines": [
-                        {
-                            "text": "第一章 引言",
-                            "boundingBox": "10,10,200,30",
-                            "words": [
-                                {"word": "第", "boundingBox": "10,10,20,30"},
-                                {"word": "一", "boundingBox": "20,10,30,30"},
-                                {"word": "章", "boundingBox": "30,10,40,30"},
-                                {"word": "引", "boundingBox": "50,10,60,30"},
-                                {"word": "言", "boundingBox": "60,10,70,30"}
-                            ]
-                        }
-                    ]
-                },
-                {
-                    "lang": "zh-CHS",
-                    "dir": "h",
-                    "boundingBox": "10,50,300,80",
-                    "lines": [
-                        {
-                            "text": "这是一个示例文档，用于演示OCR转Markdown的功能。",
-                            "boundingBox": "10,50,300,80",
-                            "words": [
-                                {"word": "这", "boundingBox": "10,50,20,80"},
-                                {"word": "是", "boundingBox": "20,50,30,80"},
-                                # ... 更多单词
-                            ]
-                        }
-                    ]
-                }
-            ]
-        }
-    }
-
-    # 创建转换器
-    converter = OCRToMarkdownConverter()
-
-    # 转换为Markdown
-    markdown_content = converter.convert_json_to_markdown(sample_json)
-
-    print("转换结果:")
-    print(markdown_content)
-
-
 if __name__ == "__main__":
-    # demo_usage()
     with open('o_ocr.json', 'r', encoding='utf-8') as f:
         json_data = json.load(f)
-        converter = OCRToMarkdownConverter()
-        md = converter.convert_json_to_markdown(json_data)
-        print(md)
+        tl_conv = OCRJsonToTextLine()
+        text_with_layout = tl_conv.convert_json_to_text(json_data)
+        with open('o_ocr.txt', 'w', encoding='utf-8') as f:
+            f.write(text_with_layout)
+
+    print(text_with_layout)
