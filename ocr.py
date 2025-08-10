@@ -14,7 +14,7 @@ APP_KEY = '57de4a67883a784c'
 APP_SECRET = 'MW3xKi21eLXyGSHOLAHVhTb7bTwM4jqz'
 
 # 待识别图片路径, 例windows路径：PATH = "C:\\youdao\\media.jpg"
-PATH = 'o.jpg'
+PATH = '2_dsk.jpg'
 
 
 def createRequest():
